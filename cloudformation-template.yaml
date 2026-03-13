@@ -1,0 +1,401 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Tag Change Monitor for AWS MGN and DRS - Monitors critical
+  service-managed tags and alerts on modifications that could
+  cause replication failures or instance terminations.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Notification Settings
+        Parameters:
+          - NotificationEmail
+      - Label:
+          default: Audit Settings
+        Parameters:
+          - EnableAuditLog
+          - AuditRetentionDays
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive tag change alerts
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  EnableAuditLog:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable DynamoDB audit logging of tag changes
+
+  AuditRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 7
+    MaxValue: 365
+    Description: Days to retain audit records in DynamoDB
+
+Conditions:
+  CreateAuditTable: !Equals [!Ref EnableAuditLog, 'true']
+
+Resources:
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alerts'
+      DisplayName: Tag Change Alerts
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    Condition: CreateAuditTable
+    Properties:
+      TableName: !Sub '${AWS::StackName}-audit'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TagMonitorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: SNSPublish
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Sid: DynamoDBWrite
+                Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !If
+                  - CreateAuditTable
+                  - !GetAtt AuditTable.Arn
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-audit'
+              - Sid: EC2Describe
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                Resource: '*'
+
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-code-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupRule
+            Status: Enabled
+            ExpirationInDays: 1
+
+  MonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-function'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertTopic
+          AUDIT_TABLE: !If [CreateAuditTable, !Ref AuditTable, !Sub '${AWS::StackName}-audit']
+          ENABLE_AUDIT_LOG: !Ref EnableAuditLog
+          AUDIT_RETENTION_DAYS: !Ref AuditRetentionDays
+      Code:
+        ZipFile: |
+          import json,boto3,os
+          from datetime import datetime
+          sns=boto3.client('sns');ddb=boto3.resource('dynamodb');ec2=boto3.client('ec2')
+          CT={"AWSApplicationMigrationServiceManaged","AWSApplicationMigrationServiceSourceServerID","AwsApplicationMigrationService-SourcePath","AwsApplicationMigrationService-SourceServerID","mgn.amazonaws.com-job","mgn.amazonaws.com-source-server","AWSElasticDisasterRecoveryManaged","AWSElasticDisasterRecoverySourceServerID","AwsElasticDisasterRecovery-SourcePath","AwsElasticDisasterRecovery-SourceServerID","elasticDisasterRecovery.amazonaws.com-job","elasticDisasterRecovery.amazonaws.com-source-server","aws:elasticDisasterRecovery:source-server-id"}
+          PX=["AWSApplicationMigrationService","AwsApplicationMigrationService","mgn.amazonaws.com","AWSElasticDisasterRecovery","AwsElasticDisasterRecovery","elasticDisasterRecovery.amazonaws.com","aws:elasticDisasterRecovery","aws:drs"]
+          DC=[{"k":"AWSApplicationMigrationServiceManaged","v":"mgn.amazonaws.com","s":"MGN"},{"k":"Name","v":"AWS Application Migration Service Replication Server","s":"MGN"},{"k":"Name","v":"AWS Application Migration Service Conversion Server","s":"MGN"},{"k":"AWSElasticDisasterRecoveryManaged","v":"elasticDisasterRecovery.amazonaws.com","s":"DRS"},{"k":"Name","v":"AWS Elastic Disaster Recovery Replication Server","s":"DRS"},{"k":"Name","v":"AWS Elastic Disaster Recovery Conversion Server","s":"DRS"},{"k":"Name","v":"AWS Elastic Disaster Recovery Recovery Instance","s":"DRS"}]
+          DN={"AWS Elastic Disaster Recovery Replication Server","AWS Elastic Disaster Recovery Conversion Server","AWS Elastic Disaster Recovery Recovery Instance"}
+          MN={"AWS Application Migration Service Replication Server","AWS Application Migration Service Conversion Server"}
+          SL={"AWSServiceRoleForApplicationMigrationService":"MGN","AWSServiceRoleForElasticDisasterRecovery":"DRS"}
+          IV={"mgn.amazonaws.com","drs.amazonaws.com","elasticDisasterRecovery.amazonaws.com"}
+          TP=os.environ.get('SNS_TOPIC_ARN');TB=os.environ.get('AUDIT_TABLE','a');AU=os.environ.get('ENABLE_AUDIT_LOG','true').lower()=='true';RT=int(os.environ.get('AUDIT_RETENTION_DAYS','90'))
+          def lambda_handler(e,c):
+              print(json.dumps(e));d=e.get('detail',{});en=d.get('eventName','');et=d.get('eventTime','');rg=d.get('awsRegion','');si=d.get('sourceIPAddress','');ua=d.get('userAgent','');es=d.get('eventSource','')
+              if d.get('errorCode'):return{"statusCode":200,"body":"Skip"}
+              if en=='TerminateInstances':return _term(d,et,rg)
+              ui=d.get('userIdentity',{})
+              if str(ui.get('invokedBy',''))in IV:return{"statusCode":200,"body":"Svc skip"}
+              p=_p(ui);sn=str(p.get('service','')).lower()
+              if p.get('type')=='AWSService'and any(k in sn for k in['mgn','drs','disaster','migration']):return{"statusCode":200,"body":"Svc skip"}
+              r,t,a=_drs(en,d)if es=='drs.amazonaws.com'else _ec2(en,d)
+              if not r or not t:return{"statusCode":200,"body":"No data"}
+              cm=_fc(t);dc=_fd(t);na=_fn(t,a);sv=_sv(a,cm,dc,r,na)
+              if sv=="NONE":return{"statusCode":200,"body":"No critical tags affected"}
+              sc=_si(cm,dc);nw=""
+              if a=='TAG_ADDED':
+                  nm=_nm(r)
+                  if nm:sv="CRITICAL";nw=_nw(nm,sc)
+              n=_bn(sv,a,en,et,rg,p,si,ua,r,cm,dc,t,sc,nw,na);_sn(n,sv)
+              if AU:_au(n)
+              return{"statusCode":200,"body":f"Alert sent: {sv}"}
+          def _term(d,et,rg):
+              rp=d.get('requestParameters',{});ii=[i.get('instanceId','')for i in rp.get('instancesSet',{}).get('items',[])]
+              re=d.get('responseElements',{});si=[f"  {i.get('instanceId','')}: {i.get('previousState',{}).get('name','?')}->{i.get('currentState',{}).get('name','?')}"for i in re.get('instancesSet',{}).get('items',[])]
+              rn=d.get('userIdentity',{}).get('sessionContext',{}).get('sessionIssuer',{}).get('userName','?');sv=SL.get(rn,'Unknown')
+              m=f"{sv} TERMINATED INSTANCES-CRITICAL\n{'='*60}\nTime:{et}\nRegion:{rg}\nService:{sv}\nRole:{rn}\n\nTERMINATED:\n{chr(10).join(si)}\n\nCan happen in UNDER 5 MIN. Check deleteOnTermination.\n{'='*60}"
+              try:sns.publish(TopicArn=TP,Subject=f"[CRITICAL]{sv} Terminated {len(ii)} Instance(s)!",Message=m)
+              except Exception as x:print(f"E:{x}")
+              if AU:
+                  try:ddb.Table(TB).put_item(Item={'event_id':f"{sv}_T_{et}",'timestamp':et,'severity':'CRITICAL','event_name':f'Term_{sv}','principal':json.dumps({'role':rn}),'resources':ii,'tags':json.dumps(si),'affected_services':[sv],'ttl':int(datetime.utcnow().timestamp())+(RT*86400)})
+                  except:pass
+              return{"statusCode":200,"body":f"{sv} term alert"}
+          def _p(ui):
+              t=ui.get('type','?')
+              if t=='AssumedRole':
+                  s=ui.get('sessionContext',{}).get('sessionIssuer',{});a=ui.get('arn','');ps=a.split('/')
+                  return{'type':'AssumedRole','role':s.get('userName','?'),'session':ps[-1]if len(ps)>2 else'?','arn':a,'account':ui.get('accountId','?')}
+              if t=='AWSService':return{'type':'AWSService','service':ui.get('invokedBy','?'),'arn':'N/A','account':ui.get('accountId','?')}
+              if t=='IAMUser':return{'type':'IAMUser','username':ui.get('userName','?'),'arn':ui.get('arn',''),'account':ui.get('accountId','?')}
+              return{'type':t,'arn':ui.get('arn','?'),'account':ui.get('accountId','?')}
+          def _ec2(en,d):
+              rp=d.get('requestParameters',{});r=[];t=[];a=''
+              if en in('CreateTags','DeleteTags'):
+                  a='TAG_ADDED'if en=='CreateTags'else'TAG_REMOVED';r=[x.get('resourceId','')for x in rp.get('resourcesSet',{}).get('items',[])];t=[{'key':x.get('key',''),'value':x.get('value','')}for x in rp.get('tagSet',{}).get('items',[])]
+              elif en=='UntagResources':a='TAG_REMOVED';r=rp.get('resourceARNList',[]);t=[{'key':k,'value':'N/A'}for k in rp.get('tagKeys',[])]
+              elif en=='TagResources':a='TAG_ADDED';r=rp.get('resourceARNList',[]);t=[{'key':k,'value':v}for k,v in rp.get('tags',{}).items()]
+              return r,t,a
+          def _drs(en,d):
+              rp=d.get('requestParameters',{});r=[];t=[];a=''
+              if en=='TagResource':a='TAG_ADDED';x=rp.get('resourceArn','');r=[x]if x else[];t=[{'key':k,'value':v}for k,v in rp.get('tags',{}).items()]
+              elif en=='UntagResource':a='TAG_REMOVED';x=rp.get('resourceArn','');r=[x]if x else[];t=[{'key':k,'value':'N/A'}for k in rp.get('tagKeys',[])]
+              return r,t,a
+          def _fc(tags):
+              m=[]
+              for tg in tags:
+                  k=tg.get('key','')
+                  if k in CT:m.append({'tag':tg,'mt':'EXACT','rule':f"Protected:{k}"});continue
+                  for p in PX:
+                      if k.startswith(p):m.append({'tag':tg,'mt':'PREFIX','rule':f"Prefix:{p}*"});break
+              return m
+          def _fd(tags):
+              f=[]
+              for dc in DC:
+                  for tg in tags:
+                      if tg.get('key','')==dc['k']and tg.get('value','')==dc['v']:f.append({'tag':tg,'svc':dc['s'],'reason':f"[{dc['s']}]{dc['k']}={dc['v']}"})
+              return f
+          def _fn(tags,act):
+              a=[]
+              for tg in tags:
+                  if tg.get('key','')=='Name':
+                      v=tg.get('value','')
+                      if v in DN:a.append(f"[DRS]{'REMOVED'if act=='TAG_REMOVED'else'APPLIED'}:{v}")
+                      if v in MN:a.append(f"[MGN]{'REMOVED'if act=='TAG_REMOVED'else'APPLIED'}:{v}")
+              return a
+          def _si(cm,dc):
+              s=set()
+              for m in cm:
+                  c=(m['tag'].get('key','')+m['tag'].get('value','')).lower()
+                  if any(k in c for k in['mgn','migration','applicationmigration']):s.add('MGN')
+                  if any(k in c for k in['drs','disaster','elasticdisasterrecovery']):s.add('DRS')
+              for x in dc:s.add(x.get('svc','?'))
+              return s if s else{'Unknown'}
+          def _nm(res):
+              nm=[];ids=[r for r in res if r.startswith('i-')]
+              if not ids:return nm
+              try:
+                  rsp=ec2.describe_instances(InstanceIds=ids[:20])
+                  for rv in rsp.get('Reservations',[]):
+                      for i in rv.get('Instances',[]):
+                          iid=i.get('InstanceId','');et={t['Key']:t['Value']for t in i.get('Tags',[])}
+                          im=any(k.startswith('AWSApplicationMigrationService')or k.startswith('mgn.amazonaws.com')for k in et if k!='AWSApplicationMigrationServiceManaged')
+                          id_=any(k.startswith('AWSElasticDisasterRecovery')or k.startswith('elasticDisasterRecovery')or k.startswith('aws:elasticDisasterRecovery')for k in et if k!='AWSElasticDisasterRecoveryManaged')
+                          if not im and not id_:
+                              dt=False
+                              for b in i.get('BlockDeviceMappings',[]):
+                                  if b.get('DeviceName','')in['/dev/sda1','/dev/xvda']:dt=b.get('Ebs',{}).get('DeleteOnTermination',False)
+                              nm.append({'id':iid,'name':et.get('Name','?'),'type':i.get('InstanceType',''),'state':i.get('State',{}).get('Name',''),'dot':dt})
+              except Exception as x:print(f"W:{x}")
+              return nm
+          def _nw(nmi,svcs):
+              sv="/".join(sorted(svcs));d=[f"  {i['id']}({i['name']}) Type:{i['type']} deleteOnTerm:{i['dot']}{' ***DATA LOSS RISK***'if i['dot']else''}"for i in nmi]
+              return f"\n{'!'*60}\nDANGER:{sv} TAGS ON NON-MANAGED INSTANCES\nTermination in UNDER 5 MIN\n{chr(10).join(d)}\n{'!'*60}\n"
+          def _sv(act,cm,dc,res,na):
+              if not cm and not dc and not na:return"NONE"
+              if dc or na:return"CRITICAL"
+              if len(cm)>=3 or len(res)>=3:return"CRITICAL"
+              if act=='TAG_REMOVED'and cm:return"HIGH"
+              if act=='TAG_ADDED'and[m for m in cm if m['mt']=='EXACT']:return"HIGH"
+              return"MEDIUM"
+          def _bn(sev,act,en,et,rg,p,si,ua,res,cm,dc,tags,svcs,nw,na):
+              ad={"TAG_ADDED":"Tags ADDED to","TAG_REMOVED":"Tags REMOVED from"};sv="+".join(sorted(svcs))
+              rl="\n".join([f"  -{r}"for r in res[:20]]);tl="\n".join([f"  -{t['key']}={t['value']}"for t in tags])
+              ms=("\nCRIT MATCHES:\n"+"\n".join([f"  [{m['mt']}]{m['tag']['key']}->{m['rule']}"for m in cm]))if cm else""
+              ds=("\nDANGEROUS:\n"+"\n".join([f"  [{c['svc']}]{c['tag']['key']}={c['tag']['value']}"for c in dc]))if dc else""
+              ns=("\nNAME ALERTS:\n"+"\n".join([f"  {a}"for a in na]))if na else""
+              w=f"Role:{p.get('role','?')}/Session:{p.get('session','?')}"if p.get('type')=='AssumedRole'else f"{p.get('type','?')}:{p.get('arn','?')}"
+              sw=""
+              if'MGN'in svcs:sw+="\n[MGN]Replication STALL/TERMINATION in <5min/DATA LOSS if deleteOnTermination=true"
+              if'DRS'in svcs:sw+="\n[DRS]Do NOT alter DRS Name tags/TERMINATION in <5min/RPO MISS risk"
+              mg=f"TAG CHANGE ALERT-{sev}\nService(s):{sv}\n{'='*60}\nEvent:{ad.get(act,en)} {len(res)} resource(s)\nTime:{et}\nRegion:{rg}\nAccount:{p.get('account','?')}\nAPI:{en}\nWho:{w}\nIP:{si}\n\nRESOURCES:\n{rl}\n\nTAGS {act.replace('_',' ')}:\n{tl}{ms}{ds}{ns}{nw}\nWARNINGS:{sw}\n\nACTIONS:\n1.Verify authorized\n2.Restore removed tags\n3.Never apply svc tags to non-managed\n4.Check MGN/DRS console\n{'='*60}\n{datetime.utcnow().isoformat()}Z"
+              return{'subject':f"[{sev}][{sv}]{en} on {len(res)} resource(s)"[:100],'message':mg,'severity':sev,'event_name':en,'event_time':et,'principal':p,'resources':res,'tags':tags,'affected_services':list(svcs)}
+          def _sn(n,sev):
+              try:sns.publish(TopicArn=TP,Subject=n['subject'],Message=n['message'],MessageAttributes={'severity':{'DataType':'String','StringValue':sev}})
+              except Exception as x:print(f"E:{x}");raise
+          def _au(n):
+              try:ddb.Table(TB).put_item(Item={'event_id':f"{n['event_time']}_{n['event_name']}_{datetime.utcnow().strftime('%f')}",'timestamp':n['event_time'],'severity':n['severity'],'event_name':n['event_name'],'principal':json.dumps(n['principal']),'resources':n['resources'][:25],'tags':json.dumps(n['tags']),'affected_services':n.get('affected_services',[]),'ttl':int(datetime.utcnow().timestamp())+(RT*86400)})
+              except Exception as x:print(f"Audit:{x}")
+
+  EC2TagRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-ec2-tags'
+      Description: Monitors EC2 CreateTags and DeleteTags
+      State: ENABLED
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [ec2.amazonaws.com]
+          eventName: [CreateTags, DeleteTags]
+      Targets:
+        - Id: Lambda
+          Arn: !GetAtt MonitorFunction.Arn
+
+  TaggingAPIRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-tagging-api'
+      Description: Monitors Tag Editor operations
+      State: ENABLED
+      EventPattern:
+        source: [aws.tag]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [tagging.amazonaws.com]
+          eventName: [TagResources, UntagResources]
+      Targets:
+        - Id: Lambda
+          Arn: !GetAtt MonitorFunction.Arn
+
+  TerminationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-termination'
+      Description: Detects MGN or DRS service terminations
+      State: ENABLED
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [ec2.amazonaws.com]
+          eventName: [TerminateInstances]
+          userIdentity:
+            sessionContext:
+              sessionIssuer:
+                userName:
+                  - AWSServiceRoleForApplicationMigrationService
+                  - AWSServiceRoleForElasticDisasterRecovery
+      Targets:
+        - Id: Lambda
+          Arn: !GetAtt MonitorFunction.Arn
+
+  DRSTagRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-drs-tags'
+      Description: Monitors DRS TagResource and UntagResource
+      State: ENABLED
+      EventPattern:
+        source: [aws.drs]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [drs.amazonaws.com]
+          eventName: [TagResource, UntagResource]
+      Targets:
+        - Id: Lambda
+          Arn: !GetAtt MonitorFunction.Arn
+
+  EC2TagPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EC2TagRule.Arn
+
+  TaggingAPIPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TaggingAPIRule.Arn
+
+  TerminationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TerminationRule.Arn
+
+  DRSTagPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DRSTagRule.Arn
+
+Outputs:
+  SNSTopicArn:
+    Description: SNS Topic for alerts - confirm email subscription
+    Value: !Ref AlertTopic
+
+  LambdaArn:
+    Description: Lambda function ARN
+    Value: !GetAtt MonitorFunction.Arn
+
+  AuditTableName:
+    Condition: CreateAuditTable
+    Description: DynamoDB audit table
+    Value: !Ref AuditTable
+
+  NextStep:
+    Description: Important next step
+    Value: !Sub 'Confirm the SNS email subscription sent to ${NotificationEmail}'
