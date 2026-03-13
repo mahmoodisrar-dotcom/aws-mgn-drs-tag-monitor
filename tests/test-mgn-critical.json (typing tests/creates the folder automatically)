@@ -1,0 +1,45 @@
+{
+  "version": "0",
+  "id": "test-mgn-001",
+  "detail-type": "AWS API Call via CloudTrail",
+  "source": "aws.ec2",
+  "account": "[REDACTED:BANK_ACCOUNT_NUMBER]",
+  "time": "2026-01-01T12:00:00Z",
+  "region": "us-east-1",
+  "detail": {
+    "eventVersion": "1.08",
+    "userIdentity": {
+      "type": "AssumedRole",
+      "principalId": "AROATEST:testuser@company.com",
+      "arn": "arn:aws:sts::123456789012:assumed-role/TestRole/testuser@company.com",
+      "accountId": "123456789012",
+      "sessionContext": {
+        "sessionIssuer": {
+          "type": "Role",
+          "userName": "TestRole",
+          "accountId": "123456789012"
+        }
+      }
+    },
+    "eventTime": "2026-01-01T12:00:00Z",
+    "eventSource": "ec2.amazonaws.com",
+    "eventName": "CreateTags",
+    "awsRegion": "us-east-1",
+    "sourceIPAddress": "203.0.113.50",
+    "userAgent": "Tag Editor Test",
+    "requestParameters": {
+      "resourcesSet": {
+        "items": [
+          {"resourceId": "i-0abc1111111111111"},
+          {"resourceId": "i-0abc2222222222222"}
+        ]
+      },
+      "tagSet": {
+        "items": [
+          {"key": "AWSApplicationMigrationServiceManaged", "value": "mgn.amazonaws.com"},
+          {"key": "Name", "value": "AWS Application Migration Service Replication Server"}
+        ]
+      }
+    }
+  }
+}
