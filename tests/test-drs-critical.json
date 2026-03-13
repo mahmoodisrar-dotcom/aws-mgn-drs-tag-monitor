@@ -1,0 +1,42 @@
+{
+  "version": "0",
+  "id": "test-drs-001",
+  "detail-type": "AWS API Call via CloudTrail",
+  "source": "aws.ec2",
+  "account": "123456789012",
+  "time": "2026-01-01T12:05:00Z",
+  "region": "us-east-1",
+  "detail": {
+    "eventVersion": "1.08",
+    "userIdentity": {
+      "type": "AssumedRole",
+      "principalId": "AROATEST:testuser@company.com",
+      "arn": "arn:aws:sts::123456789012:assumed-role/TestRole/testuser@company.com",
+      "accountId": "123456789012",
+      "sessionContext": {
+        "sessionIssuer": {
+          "type": "Role",
+          "userName": "TestRole",
+          "accountId": "123456789012"
+        }
+      }
+    },
+    "eventTime": "2026-01-01T12:05:00Z",
+    "eventSource": "ec2.amazonaws.com",
+    "eventName": "DeleteTags",
+    "awsRegion": "us-east-1",
+    "sourceIPAddress": "203.0.113.50",
+    "userAgent": "Tag Editor Test",
+    "requestParameters": {
+      "resourcesSet": {
+        "items": [{"resourceId": "i-0drs4444444444444"}]
+      },
+      "tagSet": {
+        "items": [
+          {"key": "AWSElasticDisasterRecoveryManaged", "value": "elasticDisasterRecovery.amazonaws.com"},
+          {"key": "Name", "value": "AWS Elastic Disaster Recovery Replication Server"}
+        ]
+      }
+    }
+  }
+}
